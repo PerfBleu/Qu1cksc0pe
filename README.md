@@ -63,6 +63,9 @@ SC0PE_MCP_TRANSPORT=stdio python3 qu1cksc0pe.py --mcp   # traditional one-client
 | `SC0PE_MCP_HOST` | `127.0.0.1` | Bind address for `streamable-http`/`sse`. |
 | `SC0PE_MCP_PORT` | `8765` | Bind port for `streamable-http`/`sse`. |
 | `SC0PE_MCP_HTTP_PATH` | `/mcp` | URL path for `streamable-http`. |
+| `SC0PE_MCP_DOWNLOAD_DIR` | system temp (`/tmp` on Linux) | Parent directory for downloaded S3 samples. Each download gets its own `qu1cksc0pe-<id>` subdirectory, deleted when the tool returns. |
+| `SC0PE_MCP_DOWNLOAD_TIMEOUT` | `120` | Seconds to wait for an S3 download. |
+| `SC0PE_MCP_S3_HOSTS` | *(empty)* | Comma-separated extra hostnames allowed as S3-compatible download links (for example a private MinIO). Amazon S3 hosts are always allowed. |
 
 A project-level `.mcp.json` is included so Claude Code picks the server up automatically for this repo. It pins `stdio` explicitly (via `env`), since Claude Code spawns and owns a fresh process per session rather than attaching to one you started yourself:
 ```json
@@ -79,6 +82,8 @@ A project-level `.mcp.json` is included so Claude Code picks the server up autom
 If `python3` on your `PATH` isn't the interpreter with Qu1cksc0pe's dependencies installed (common on Windows, or with multiple Python installs), change `command` to the full path of the right `python`/`python.exe`, or run `python3 -c "import mcp"` first to check.
 
 **Tools:** `analyze_file`, `analyze_document`, `analyze_archive`, `detect_packer`, `detect_language`, `extract_iocs`, `check_resources`, `check_signatures`, `scan_hash`, `scan_virustotal`, `configure_virustotal_api_key`, `configure_ai_api_key`, `update_hash_database`, `list_supported_file_types`. Each tool validates its input file/folder locally (rejecting files >= 50MB, since the CLI would otherwise prompt interactively) before invoking the CLI, and returns the resulting JSON report(s) plus captured console output. Interactive-only features (`--watch` dynamic analysis, `--ui`, `--install`) are intentionally not exposed as tools.
+
+**S3 inputs:** every tool that takes `file_path` also accepts an S3 download link -- an `https://` URL on Amazon S3 (including presigned URLs) or an `s3://bucket/key` URI. `s3://` needs `boto3` and the normal AWS credential chain; a presigned HTTPS URL does not. The server downloads the object into a private temporary directory (`/tmp/qu1cksc0pe-<id>/` on Linux), runs the same analysis it would on a local file, and deletes that directory before returning, including when the download or the analysis fails. The same 50MB cap applies. Redirects must stay on S3, and plain `http://` links are rejected. `folder_path` stays local-only. A successful remote call adds `source` (host and key, without the presigned query string) and `download_cleaned_up: true` to the tool result.
 
 The five analysis tools that support `ai=True` also take an `ai_provider` argument (`"auto"`/`"ollama"` (default, local), `"claude"`, `"openai"`, `"deepseek"`, `"kimi"`, or `"glm"`) -- see [AI Analysis Providers](#ai-analysis-providers) below. Configure a cloud key first with `configure_ai_api_key(provider="claude", api_key="...")` (or whichever provider).
 

@@ -19,17 +19,25 @@ command does:
 See the "MCP Server" section in README.md for client configuration.
 """
 
+import http.client
+import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
     from mcp.server import MCPServer
@@ -98,8 +106,27 @@ def _sdk_log_level() -> str:
     return raw if raw in _VALID_LOG_LEVELS else "INFO"
 
 
+def _public_object_label(url: str) -> str:
+    """Host and object key only. Presigned credentials live in the query string."""
+    parsed = urlparse(url.strip())
+    host = parsed.hostname or parsed.netloc
+    port = f":{parsed.port}" if parsed.port else ""
+    path = unquote(parsed.path or "")
+    return f"{parsed.scheme.lower()}://{host}{port}{path}"
+
+
+def _redact_logged(key: str, value: Any) -> Any:
+    if key in _REDACTED_KEYS:
+        return "<redacted>"
+    if isinstance(value, str):
+        parsed = urlparse(value.strip())
+        if parsed.scheme.lower() in ("http", "https", "s3") and parsed.netloc:
+            return _public_object_label(value)
+    return value
+
+
 def _log_call(tool_name: str, **kwargs: Any) -> None:
-    redacted = {k: ("<redacted>" if k in _REDACTED_KEYS else v) for k, v in kwargs.items()}
+    redacted = {k: _redact_logged(k, v) for k, v in kwargs.items()}
     log.info("tool call: %s(%s)", tool_name, ", ".join(f"{k}={v!r}" for k, v in redacted.items()))
 
 # qu1cksc0pe.py flags a file as "large" at this exact byte threshold and, for
@@ -127,9 +154,12 @@ mcp = MCPServer(
         "(https://github.com/CYB3RMX/Qu1cksc0pe). Supports Windows PE/MSI, "
         "Linux ELF, macOS Mach-O, Android APK/DEX/JAR, PCAP, documents, "
         "scripts (PowerShell/VBA/JS/HTA/batch/LNK) and email files. "
-        "Always pass absolute file paths. Files at or above 50MB are "
-        "rejected -- analyze a smaller sample or use the interactive CLI "
-        "directly. Call list_supported_file_types() to see which tool fits "
+        "file_path accepts a local absolute path or an S3 download link: "
+        "HTTPS on Amazon S3 (public or presigned) or s3://bucket/key. "
+        "Remote objects are downloaded into a temporary directory such as "
+        "/tmp/qu1cksc0pe-<id>/, analyzed, and deleted when the tool returns. "
+        "folder_path must be a local directory. Files at or above 50MB are "
+        "rejected. Call list_supported_file_types() to see which tool fits "
         "a given file."
     ),
     log_level=_sdk_log_level(),
@@ -173,12 +203,326 @@ def _validate_file(path_str: str) -> Path:
 def _validate_folder(path_str: str) -> Path:
     if not path_str or not str(path_str).strip():
         raise ValueError("folder_path must not be empty.")
+    if urlparse(str(path_str).strip()).scheme.lower() in ("http", "https", "s3"):
+        raise ValueError(
+            "folder_path must be a local directory. Pass an S3 download link as file_path instead."
+        )
     p = _resolve(path_str)
     if not p.exists():
         raise ValueError(f"Folder not found: {p}")
     if not p.is_dir():
         raise ValueError(f"Not a directory: {p}")
     return p
+
+
+# --------------------------------------------------------------------------
+# S3 downloads
+# --------------------------------------------------------------------------
+# file_path may be a local path or a download link. Remote objects are fetched
+# into a private temp directory, handed to the existing CLI, then removed --
+# including when the tool fails after the download starts. Only HTTPS Amazon
+# S3 (and hosts named in SC0PE_MCP_S3_HOSTS) plus s3:// URIs are accepted, so
+# this cannot be used as a general URL fetcher.
+
+_INVALID_FILENAME = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+_DOWNLOAD_CHUNK = 64 * 1024
+
+
+def _extra_s3_hosts() -> set[str]:
+    raw = os.environ.get("SC0PE_MCP_S3_HOSTS", "")
+    return {item.strip().lower().rstrip(".") for item in raw.split(",") if item.strip()}
+
+
+def _is_amazonaws_s3_host(host: str) -> bool:
+    """True for virtual-hosted and path-style Amazon S3 endpoints.
+
+    amazonaws.com is Amazon-operated, so the check is "this host is S3"
+    rather than "this host is not an internal address". Other AWS APIs
+    (sts, iam, ec2, s3control, ...) do not use an s3 / s3-* label.
+    """
+    host = host.lower().rstrip(".")
+    suffix = None
+    for candidate in (".amazonaws.com.cn", ".amazonaws.com"):
+        if host.endswith(candidate):
+            suffix = candidate
+            break
+    if suffix is None:
+        return False
+    labels = host[: -len(suffix)].split(".")
+    if not labels or any(not label for label in labels):
+        return False
+    return any(label == "s3" or label.startswith("s3-") for label in labels)
+
+
+def _host_is_s3(host: str, port: Optional[int]) -> bool:
+    normalized = (host or "").lower().rstrip(".")
+    if normalized in _extra_s3_hosts():
+        return True
+    try:
+        ipaddress.ip_address(normalized)
+        return False
+    except ValueError:
+        pass
+    if port not in (None, 443):
+        return False
+    return _is_amazonaws_s3_host(normalized)
+
+
+def _is_path_style_host(host: str) -> bool:
+    leftmost = host.lower().rstrip(".").split(".", 1)[0]
+    return leftmost == "s3" or leftmost.startswith("s3-")
+
+
+def _object_segments(url: str) -> list[str]:
+    parsed = urlparse(url.strip())
+    return [unquote(part) for part in (parsed.path or "").split("/") if part]
+
+
+def _download_filename(url: str) -> str:
+    segments = _object_segments(url)
+    raw = segments[-1] if segments else "sample.bin"
+    name = _INVALID_FILENAME.sub("_", raw).strip(" .")
+    if not name or name in (".", ".."):
+        name = "sample.bin"
+    if len(name) > 180:
+        name = name[-180:]
+    return name
+
+
+def _assert_object_key(url: str) -> None:
+    parsed = urlparse(url.strip())
+    segments = _object_segments(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme.lower() != "s3" and host not in _extra_s3_hosts() and _is_path_style_host(host):
+        if len(segments) < 2:
+            raise ValueError("S3 path-style URL must include both a bucket and an object key.")
+    elif not segments or segments[-1] in (".", ".."):
+        raise ValueError("S3 download link must point at an object key.")
+
+
+def _assert_s3_https(url: str) -> None:
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme.lower() != "https":
+        raise ValueError("S3 download links must use HTTPS.")
+    if parsed.username or parsed.password:
+        raise ValueError("S3 download links must not include embedded credentials.")
+    if not parsed.hostname:
+        raise ValueError("S3 download link is missing a host.")
+    if not _host_is_s3(parsed.hostname, parsed.port):
+        raise ValueError(
+            "Only Amazon S3 HTTPS links are accepted. "
+            "For another S3-compatible host, set SC0PE_MCP_S3_HOSTS to that hostname."
+        )
+    _assert_object_key(url)
+
+
+def _input_kind(file_path: str) -> str:
+    text = (file_path or "").strip()
+    if not text:
+        raise ValueError("file_path must not be empty.")
+    scheme = urlparse(text).scheme.lower()
+    if scheme == "s3":
+        parsed = urlparse(text)
+        if not parsed.netloc or not _object_segments(text):
+            raise ValueError("S3 URI must look like s3://bucket/key.")
+        return "s3"
+    if scheme == "http":
+        raise ValueError("S3 download links must use HTTPS, not HTTP.")
+    if scheme == "https":
+        _assert_s3_https(text)
+        return "https"
+    if scheme == "":
+        return "local"
+    # A single-letter scheme is a Windows drive path (C:\...), not a URL.
+    if len(scheme) == 1:
+        return "local"
+    raise ValueError(
+        f"Unsupported file_path scheme {scheme!r}. Pass a local path or an S3 download link."
+    )
+
+
+def _temp_parent() -> Path:
+    override = os.environ.get("SC0PE_MCP_DOWNLOAD_DIR", "").strip()
+    if override:
+        parent = Path(override).expanduser()
+        parent.mkdir(parents=True, exist_ok=True)
+        return parent
+    return Path(tempfile.gettempdir())
+
+
+def _download_timeout() -> int:
+    raw = os.environ.get("SC0PE_MCP_DOWNLOAD_TIMEOUT", "120").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 120
+    return max(5, min(value, 600))
+
+
+def _too_large(size: int) -> str:
+    return (
+        f"File is {size:,} bytes (>= 50MB limit). qu1cksc0pe.py prompts "
+        "interactively for files this large, which an MCP tool call "
+        "cannot answer. Use a smaller sample or the interactive CLI."
+    )
+
+
+def _safe_rmtree(path: Path) -> None:
+    try:
+        if path.is_symlink():
+            log.error("refusing to delete symlink temp dir: %s", path)
+            return
+        if not path.exists():
+            return
+        parent = _temp_parent().resolve()
+        resolved = path.resolve()
+        if resolved == parent or parent not in resolved.parents:
+            log.error("refusing to delete unexpected path: %s", resolved)
+            return
+        shutil.rmtree(resolved)
+        log.info("removed temp download dir: %s", resolved)
+    except OSError as exc:
+        log.warning("failed to remove temp download dir %s: %s", path, exc)
+
+
+def _write_capped(chunks, dest: Path) -> None:
+    written = 0
+    with dest.open("wb") as handle:
+        for chunk in chunks:
+            if not chunk:
+                continue
+            written += len(chunk)
+            if written >= MAX_INPUT_FILE_BYTES:
+                raise ValueError(_too_large(written))
+            handle.write(chunk)
+
+
+def _iter_reads(read) -> Any:
+    while True:
+        chunk = read(_DOWNLOAD_CHUNK)
+        if not chunk:
+            break
+        yield chunk
+
+
+class _S3RedirectHandler(HTTPRedirectHandler):
+    max_redirections = 5
+    max_repeats = 2
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_s3_https(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_https(url: str, dest_dir: Path) -> Path:
+    _assert_s3_https(url)
+    log.info("downloading sample from %s", _public_object_label(url))
+    opener = build_opener(_S3RedirectHandler)
+    request = Request(url, headers={"User-Agent": "qu1cksc0pe-mcp"}, method="GET")
+    response = None
+    try:
+        response = opener.open(request, timeout=_download_timeout())
+        length = response.headers.get("Content-Length")
+        if length and str(length).isdigit() and int(length) >= MAX_INPUT_FILE_BYTES:
+            raise ValueError(_too_large(int(length)))
+        final_url = response.geturl()
+        _assert_s3_https(final_url)
+        dest = dest_dir / _download_filename(final_url)
+        _write_capped(_iter_reads(response.read), dest)
+    except HTTPError as exc:
+        exc.close()
+        raise ValueError(f"S3 download failed with HTTP {exc.code}.") from None
+    except URLError as exc:
+        raise ValueError(f"S3 download failed: {exc.reason}") from None
+    except ValueError:
+        raise
+    except (OSError, http.client.HTTPException) as exc:
+        raise ValueError("S3 download failed.") from None
+    finally:
+        if response is not None:
+            response.close()
+    log.info("downloaded %s bytes to %s", dest.stat().st_size, dest.name)
+    return dest
+
+
+def _download_s3_uri(uri: str, dest_dir: Path) -> Path:
+    try:
+        import boto3
+        from botocore.config import Config
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ModuleNotFoundError as exc:
+        raise ValueError(
+            "s3:// URIs require boto3 and AWS credentials. "
+            "Pass an HTTPS presigned S3 URL instead, or install boto3."
+        ) from exc
+
+    parsed = urlparse(uri.strip())
+    bucket = parsed.netloc
+    key = unquote(parsed.path.lstrip("/"))
+    if not bucket or not key or key.endswith("/"):
+        raise ValueError("S3 URI must look like s3://bucket/key.")
+    log.info("downloading sample from %s", _public_object_label(uri))
+    client = boto3.client(
+        "s3",
+        config=Config(
+            connect_timeout=15,
+            read_timeout=_download_timeout(),
+            retries={"max_attempts": 2},
+        ),
+    )
+    try:
+        head = client.head_object(Bucket=bucket, Key=key)
+        size = int(head.get("ContentLength") or 0)
+        if size >= MAX_INPUT_FILE_BYTES:
+            raise ValueError(_too_large(size))
+        body = client.get_object(Bucket=bucket, Key=key)["Body"]
+        try:
+            dest = dest_dir / _download_filename(uri)
+            _write_capped(_iter_reads(body.read), dest)
+        finally:
+            body.close()
+    except ValueError:
+        raise
+    except (ClientError, BotoCoreError) as exc:
+        code = exc.__class__.__name__
+        if isinstance(exc, ClientError):
+            code = exc.response.get("Error", {}).get("Code", code)
+        raise ValueError(f"S3 download failed: {code}") from None
+    except OSError:
+        raise ValueError("S3 download failed.") from None
+    log.info("downloaded %s bytes to %s", dest.stat().st_size, dest.name)
+    return dest
+
+
+@contextmanager
+def _materialize_file(file_path: str):
+    """Yield (local_path, source_label). source_label is None for local files.
+
+    S3 objects are downloaded into a new temp directory and that directory is
+    removed when the caller finishes, including on failure.
+    """
+    kind = _input_kind(file_path)
+    if kind == "local":
+        yield _validate_file(file_path), None
+        return
+
+    tmp = Path(tempfile.mkdtemp(prefix="qu1cksc0pe-", dir=_temp_parent()))
+    log.info("download temp dir: %s", tmp)
+    try:
+        if kind == "s3":
+            path = _download_s3_uri(file_path.strip(), tmp)
+        else:
+            path = _download_https(file_path.strip(), tmp)
+        yield _validate_file(str(path)), _public_object_label(file_path)
+    finally:
+        _safe_rmtree(tmp)
+
+
+def _annotate_source(result: dict[str, Any], source: Optional[str]) -> dict[str, Any]:
+    if source:
+        result["source"] = source
+        result["download_cleaned_up"] = True
+    return result
 
 
 def _require_exactly_one(file_path: Optional[str], folder_path: Optional[str]) -> None:
@@ -361,20 +705,25 @@ def analyze_file(
     commands, filesystem operations and network requests are never executed.
     The document report's emulation.javascript list contains findings, an IOC
     trace, decoded eval layers, network/process attempts and virtual writes.
+
+    file_path may be a local absolute path, an HTTPS S3 download link (public
+    or presigned), or s3://bucket/key. A remote object is downloaded into a
+    temporary directory, analyzed, and deleted before this tool returns.
     """
     _log_call("analyze_file", file_path=file_path, ai=ai, ai_provider=ai_provider,
                timeout_seconds=timeout_seconds)
     try:
-        path = _validate_file(file_path)
         provider_args = _ai_provider_args(ai_provider)
+        with _materialize_file(file_path) as (path, source):
+            args = ["--file", str(path), "--analyze", "--report"]
+            if ai:
+                args.append("--ai")
+            args += provider_args
+            result = _run_cli(args, timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("analyze_file rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    args = ["--file", str(path), "--analyze", "--report"]
-    if ai:
-        args.append("--ai")
-    args += provider_args
-    return _run_cli(args, timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -387,21 +736,23 @@ def analyze_document(
     """Analyze a document/macro/VBScript-family file (.doc*, .xls*, .vbs, .vbe, .vba, .vb, .bas, .cls, .frm, ...).
 
     Equivalent to `qu1cksc0pe.py --file <file> --docs --report`. See
-    analyze_file's docstring for AI options and automatic emulation.
+    analyze_file's docstring for AI options, automatic emulation, and S3
+    download links. A remote object is deleted after analysis.
     """
     _log_call("analyze_document", file_path=file_path, ai=ai, ai_provider=ai_provider,
                timeout_seconds=timeout_seconds)
     try:
-        path = _validate_file(file_path)
         provider_args = _ai_provider_args(ai_provider)
+        with _materialize_file(file_path) as (path, source):
+            args = ["--file", str(path), "--docs", "--report"]
+            if ai:
+                args.append("--ai")
+            args += provider_args
+            result = _run_cli(args, timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("analyze_document rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    args = ["--file", str(path), "--docs", "--report"]
-    if ai:
-        args.append("--ai")
-    args += provider_args
-    return _run_cli(args, timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -409,20 +760,22 @@ def analyze_archive(file_path: str, ai: bool = False, ai_provider: Optional[str]
     """Analyze an archive file (.zip, .rar, .ace, ...): lists contents and scans nested files for IOCs/YARA matches.
 
     Equivalent to `qu1cksc0pe.py --file <file> --archive --report`. See
-    analyze_file's docstring for what ai/ai_provider do.
+    analyze_file's docstring for what ai/ai_provider do and for S3 download
+    links. A remote object is deleted after analysis.
     """
     _log_call("analyze_archive", file_path=file_path, ai=ai, ai_provider=ai_provider, timeout_seconds=timeout_seconds)
     try:
-        path = _validate_file(file_path)
         provider_args = _ai_provider_args(ai_provider)
+        with _materialize_file(file_path) as (path, source):
+            args = ["--file", str(path), "--archive", "--report"]
+            if ai:
+                args.append("--ai")
+            args += provider_args
+            result = _run_cli(args, timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("analyze_archive rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    args = ["--file", str(path), "--archive", "--report"]
-    if ai:
-        args.append("--ai")
-    args += provider_args
-    return _run_cli(args, timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -444,6 +797,10 @@ def detect_packer(
     analyze_archive -- ai_provider has NO effect on it (cloud providers are
     not supported for this specific tool) and it silently falls back to
     "unavailable" if Ollama isn't reachable.
+
+    file_path may be a local path or an S3 download link (see analyze_file).
+    folder_path must be a local directory. A downloaded object is deleted
+    after the scan.
     """
     _log_call("detect_packer", file_path=file_path, folder_path=folder_path, report=report, ai=ai, ai_provider=ai_provider, timeout_seconds=timeout_seconds)
     if ai and str(ai_provider or "").strip().lower() in _CLOUD_AI_PROVIDERS:
@@ -451,25 +808,32 @@ def detect_packer(
             "detect_packer: ai_provider=%r has no effect here -- this tool's AI pattern "
             "assist is Ollama-only, unlike the report summarizer.", ai_provider,
         )
+    source = None
     try:
         _require_exactly_one(file_path, folder_path)
+        provider_args = _ai_provider_args(ai_provider)
         if file_path:
-            target = _validate_file(file_path)
-            args = ["--file", str(target)]
+            with _materialize_file(file_path) as (target, source):
+                args = ["--file", str(target), "--packer"]
+                if report or ai:
+                    args.append("--report")
+                if ai:
+                    args.append("--ai")
+                args += provider_args
+                result = _run_cli(args, timeout=timeout_seconds)
         else:
             target = _validate_folder(folder_path)
-            args = ["--folder", str(target)]
-        provider_args = _ai_provider_args(ai_provider)
+            args = ["--folder", str(target), "--packer"]
+            if report or ai:
+                args.append("--report")
+            if ai:
+                args.append("--ai")
+            args += provider_args
+            result = _run_cli(args, timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("detect_packer rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    args = args + ["--packer"]
-    if report or ai:
-        args.append("--report")
-    if ai:
-        args.append("--ai")
-    args += provider_args
-    return _run_cli(args, timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -481,6 +845,8 @@ def detect_language(file_path: str, report: bool = True, ai: bool = False, ai_pr
     built into languageDetect.py, NOT Qu1cksc0pe's report summarizer used by
     analyze_file/analyze_document/analyze_archive -- ai_provider has NO
     effect on it (cloud providers are not supported for this specific tool).
+    file_path may be a local path or an S3 download link (see analyze_file).
+    A downloaded object is deleted after the scan.
     """
     _log_call("detect_language", file_path=file_path, report=report, ai=ai, ai_provider=ai_provider, timeout_seconds=timeout_seconds)
     if ai and str(ai_provider or "").strip().lower() in _CLOUD_AI_PROVIDERS:
@@ -489,18 +855,19 @@ def detect_language(file_path: str, report: bool = True, ai: bool = False, ai_pr
             "assist is Ollama-only, unlike the report summarizer.", ai_provider,
         )
     try:
-        path = _validate_file(file_path)
         provider_args = _ai_provider_args(ai_provider)
+        with _materialize_file(file_path) as (path, source):
+            args = ["--file", str(path), "--lang"]
+            if report or ai:
+                args.append("--report")
+            if ai:
+                args.append("--ai")
+            args += provider_args
+            result = _run_cli(args, timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("detect_language rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    args = ["--file", str(path), "--lang"]
-    if report or ai:
-        args.append("--report")
-    if ai:
-        args.append("--ai")
-    args += provider_args
-    return _run_cli(args, timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -508,17 +875,20 @@ def extract_iocs(file_path: str, report: bool = True, timeout_seconds: int = 300
     """Extract URLs, IP addresses and email addresses embedded in a file.
 
     Equivalent to `qu1cksc0pe.py --file <file> --domain [--report]`.
+    file_path may be a local path or an S3 download link (see analyze_file).
+    A downloaded object is deleted after extraction.
     """
     _log_call("extract_iocs", file_path=file_path, report=report, timeout_seconds=timeout_seconds)
     try:
-        path = _validate_file(file_path)
+        with _materialize_file(file_path) as (path, source):
+            args = ["--file", str(path), "--domain"]
+            if report:
+                args.append("--report")
+            result = _run_cli(args, timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("extract_iocs rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    args = ["--file", str(path), "--domain"]
-    if report:
-        args.append("--report")
-    return _run_cli(args, timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -526,15 +896,18 @@ def check_resources(file_path: str, timeout_seconds: int = 180) -> dict[str, Any
     """Extract and inspect a PE file's embedded resources (icons, manifests, carved payloads, ...).
 
     Equivalent to `qu1cksc0pe.py --file <file> --resource`. Console output
-    only -- this analyzer does not produce a JSON report.
+    only -- this analyzer does not produce a JSON report. file_path may be a
+    local path or an S3 download link (see analyze_file). A downloaded
+    object is deleted afterwards.
     """
     _log_call("check_resources", file_path=file_path, timeout_seconds=timeout_seconds)
     try:
-        path = _validate_file(file_path)
+        with _materialize_file(file_path) as (path, source):
+            result = _run_cli(["--file", str(path), "--resource"], timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("check_resources rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    return _run_cli(["--file", str(path), "--resource"], timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -542,15 +915,18 @@ def check_signatures(file_path: str, timeout_seconds: int = 180) -> dict[str, An
     """Scan a file for embedded/carved file signatures (e.g. an EXE hidden inside another file type).
 
     Equivalent to `qu1cksc0pe.py --file <file> --sigcheck`. Console output
-    only -- this analyzer does not produce a JSON report.
+    only -- this analyzer does not produce a JSON report. file_path may be a
+    local path or an S3 download link (see analyze_file). A downloaded
+    object is deleted afterwards.
     """
     _log_call("check_signatures", file_path=file_path, timeout_seconds=timeout_seconds)
     try:
-        path = _validate_file(file_path)
+        with _materialize_file(file_path) as (path, source):
+            result = _run_cli(["--file", str(path), "--sigcheck"], timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("check_signatures rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    return _run_cli(["--file", str(path), "--sigcheck"], timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -566,21 +942,11 @@ def scan_hash(
     missing. Equivalent to
     `qu1cksc0pe.py --hashscan (--file <file>|--folder <folder>)`. Only the
     folder/multi-file form writes a JSON report; a single-file scan returns
-    console output only.
+    console output only. file_path may be a local path or an S3 download
+    link (see analyze_file). folder_path must be a local directory. A
+    downloaded object is deleted after the lookup.
     """
     _log_call("scan_hash", file_path=file_path, folder_path=folder_path, timeout_seconds=timeout_seconds)
-    try:
-        _require_exactly_one(file_path, folder_path)
-        if file_path:
-            target = _validate_file(file_path)
-            args = ["--file", str(target)]
-        else:
-            target = _validate_folder(folder_path)
-            args = ["--folder", str(target)]
-    except ValueError as exc:
-        log.warning("scan_hash rejected: %s", exc)
-        return {"ok": False, "error": str(exc)}
-
     hash_db = Path.home() / "sc0pe_Base" / "HashDB"
     if not hash_db.exists():
         log.warning("scan_hash rejected: hash database missing at %s", hash_db)
@@ -591,9 +957,19 @@ def scan_hash(
                 "Call update_hash_database() first."
             ),
         }
-
-    args = args + ["--hashscan"]
-    return _run_cli(args, timeout=timeout_seconds)
+    source = None
+    try:
+        _require_exactly_one(file_path, folder_path)
+        if file_path:
+            with _materialize_file(file_path) as (target, source):
+                result = _run_cli(["--file", str(target), "--hashscan"], timeout=timeout_seconds)
+        else:
+            target = _validate_folder(folder_path)
+            result = _run_cli(["--folder", str(target), "--hashscan"], timeout=timeout_seconds)
+    except ValueError as exc:
+        log.warning("scan_hash rejected: %s", exc)
+        return {"ok": False, "error": str(exc)}
+    return _annotate_source(result, source)
 
 
 @mcp.tool()
@@ -601,15 +977,18 @@ def scan_virustotal(file_path: str, timeout_seconds: int = 120) -> dict[str, Any
     """Look up a file's hash on VirusTotal (does not upload the file).
 
     Requires a VirusTotal API key configured via configure_virustotal_api_key
-    first. Equivalent to `qu1cksc0pe.py --file <file> --vtFile`.
+    first. Equivalent to `qu1cksc0pe.py --file <file> --vtFile`. file_path
+    may be a local path or an S3 download link (see analyze_file). A
+    downloaded object is deleted after the lookup.
     """
     _log_call("scan_virustotal", file_path=file_path, timeout_seconds=timeout_seconds)
     try:
-        path = _validate_file(file_path)
+        with _materialize_file(file_path) as (path, source):
+            result = _run_cli(["--file", str(path), "--vtFile"], timeout=timeout_seconds)
     except ValueError as exc:
         log.warning("scan_virustotal rejected: %s", exc)
         return {"ok": False, "error": str(exc)}
-    return _run_cli(["--file", str(path), "--vtFile"], timeout=timeout_seconds)
+    return _annotate_source(result, source)
 
 
 # provider id -> key filename under ~/sc0pe_Base/, mirrors qu1cksc0pe.py's
@@ -739,7 +1118,7 @@ _SUPPORTED_FILE_TYPES = {
 
 @mcp.tool()
 def list_supported_file_types() -> dict[str, Any]:
-    """List the file types Qu1cksc0pe recognizes and which tool to use for each. Call this first if unsure which tool applies to a file."""
+    """List the file types Qu1cksc0pe recognizes and which tool to use for each. Call this first if unsure which tool applies to a file. Tools that take file_path also accept an S3 download link."""
     _log_call("list_supported_file_types")
     return {"file_types": _SUPPORTED_FILE_TYPES}
 
